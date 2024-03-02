@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/format/pktline"
@@ -13,9 +14,10 @@ import (
 )
 
 var (
-	shallowLineLength       = len(shallow) + hashSize
-	minCommandLength        = hashSize*2 + 2 + 1
-	minCommandAndCapsLength = minCommandLength + 1
+	shallowLineLength        = len(shallow) + hashSize
+	minCommandLength         = hashSize*2 + 2 + 1
+	minCommandAndCapsLength  = minCommandLength + 1
+	minPushCertAndCapsLength = len(pushCert) + 1
 )
 
 var (
@@ -47,6 +49,12 @@ func errInvalidCommandCapabilitiesLineLength(got int) error {
 	return errMalformedRequest(fmt.Sprintf(
 		"invalid command and capabilities line length: expected at least %d, got %d",
 		minCommandAndCapsLength, got))
+}
+
+func errInvalidPushCertCapabilitiesLineLength(got int) error {
+	return errMalformedRequest(fmt.Sprintf(
+		"invalid push-cert and capabilities line length: expected at least %d, got %d",
+		minPushCertAndCapsLength, got))
 }
 
 func errInvalidCommandLineLength(got int) error {
@@ -104,6 +112,9 @@ func (d *updReqDecoder) Decode(req *ReferenceUpdateRequest) error {
 	funcs := []func() error{
 		d.scanLine,
 		d.decodeShallow,
+	}
+
+	funcsCommand := []func() error{
 		d.decodeCommandAndCapabilities,
 		d.decodeCommands,
 		d.decodePushOptions,
@@ -111,7 +122,27 @@ func (d *updReqDecoder) Decode(req *ReferenceUpdateRequest) error {
 		req.validate,
 	}
 
+	funcsPushCert := []func() error{
+		d.decodePushCert,
+		d.decodeCommandsPushCert,
+		d.decodePGPSignature,
+		d.decodePushOptions,
+		d.setPackfile,
+		req.validate,
+	}
+
 	for _, f := range funcs {
+		if err := f(); err != nil {
+			return err
+		}
+	}
+
+	funcsRest := funcsCommand
+	if bytes.HasPrefix(d.s.Bytes(), pushCert) {
+		funcsRest = funcsPushCert
+	}
+
+	for _, f := range funcsRest {
 		if err := f(); err != nil {
 			return err
 		}
@@ -157,6 +188,27 @@ func (d *updReqDecoder) decodeCommands() error {
 	for {
 		b := d.s.Bytes()
 		if bytes.Equal(b, pktline.Flush) {
+			return nil
+		}
+
+		c, err := parseCommand(b)
+		if err != nil {
+			return err
+		}
+
+		d.req.Commands = append(d.req.Commands, c)
+
+		if ok := d.s.Scan(); !ok {
+			return d.s.Err()
+		}
+	}
+}
+
+func (d *updReqDecoder) decodeCommandsPushCert() error {
+	beginPrefix := []byte("-----BEGIN")
+	for {
+		b := d.s.Bytes()
+		if bytes.HasPrefix(b, beginPrefix) {
 			return nil
 		}
 
@@ -237,6 +289,113 @@ func (d *updReqDecoder) decodePushOptions() error {
 	}
 }
 
+func (d *updReqDecoder) decodePushCert() error {
+	b := d.s.Bytes()
+	i := bytes.IndexByte(b, 0)
+	if i == -1 {
+		return errMissingCapabilitiesDelimiter
+	}
+
+	if len(b) < minPushCertAndCapsLength {
+		return errInvalidPushCertCapabilitiesLineLength(len(b))
+	}
+
+	if err := d.req.Capabilities.Decode(b[i+1:]); err != nil {
+		return err
+	}
+
+	if err := d.scanLine(); err != nil {
+		return err
+	}
+	b = d.s.Bytes()
+
+	certVersionLine := []byte("certificate version 0.1\n")
+	if !bytes.Equal(b, certVersionLine) {
+		return fmt.Errorf("invalid push certificate version: %s", b)
+	}
+
+	d.req.Certificate = &Certificate{}
+
+	if err := d.scanLine(); err != nil {
+		return err
+	}
+	b = d.s.Bytes()
+	pusherPrefix := []byte("pusher ")
+	if !bytes.HasPrefix(b, pusherPrefix) {
+		return fmt.Errorf("expected pusher prefix: %s", b)
+	}
+	// remove trailing LF
+	pusher := string(b[len(pusherPrefix) : len(b)-1])
+	d.req.Certificate.Pusher = pusher
+
+	if err := d.scanLine(); err != nil {
+		return err
+	}
+	b = d.s.Bytes()
+	pusheePrefix := []byte("pushee ")
+	if !bytes.HasPrefix(b, pusheePrefix) {
+		return fmt.Errorf("expected pushee prefix: %s", b)
+	}
+	// remove trailing LF
+	pushee := string(b[len(pusheePrefix) : len(b)-1])
+	d.req.Certificate.Pushee = pushee
+
+	if err := d.scanLine(); err != nil {
+		return err
+	}
+	b = d.s.Bytes()
+	noncePrefix := []byte("nonce ")
+	if !bytes.HasPrefix(b, noncePrefix) {
+		return fmt.Errorf("expected nonce prefix: %s", b)
+	}
+	// remove trailing LF
+	nonce := string(b[len(noncePrefix) : len(b)-1])
+	d.req.Certificate.Nonce = nonce
+
+	for {
+		if err := d.scanLine(); err != nil {
+			return err
+		}
+		b = d.s.Bytes()
+		if bytes.Equal(b, []byte("\n")) {
+			break
+		}
+		fmt.Println("ignoring option", string(b))
+	}
+
+	if err := d.scanLine(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (d *updReqDecoder) decodePGPSignature() error {
+	pushCertEnd := []byte("push-cert-end\n")
+	sb := strings.Builder{}
+
+	for {
+		b := d.s.Bytes()
+		if bytes.Equal(b, pushCertEnd) {
+			break
+		}
+		if _, err := sb.Write(b); err != nil {
+			return err
+		}
+		if err := d.scanLine(); err != nil {
+			return err
+		}
+	}
+	d.req.Certificate.PGPSignature = sb.String()
+
+	// discard the next line
+	if err := d.scanLine(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func parseCommand(b []byte) (*Command, error) {
 	if len(b) < minCommandLength {
 		return nil, errInvalidCommandLineLength(len(b))
@@ -246,7 +405,8 @@ func parseCommand(b []byte) (*Command, error) {
 		os, ns string
 		n      plumbing.ReferenceName
 	)
-	if _, err := fmt.Sscanf(string(b), "%s %s %s", &os, &ns, &n); err != nil {
+	cmd := strings.TrimSpace(string(b))
+	if _, err := fmt.Sscanf(cmd, "%s %s %s", &os, &ns, &n); err != nil {
 		return nil, errMalformedCommand(err)
 	}
 

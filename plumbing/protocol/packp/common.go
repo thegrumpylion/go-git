@@ -42,6 +42,7 @@ var (
 
 	// updreq
 	shallowNoSp = []byte("shallow")
+	pushCert    = []byte("push-cert")
 )
 
 func isFlush(payload []byte) bool {

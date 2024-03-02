@@ -14,6 +14,14 @@ var (
 	ErrMalformedCommand = errors.New("malformed command")
 )
 
+type Certificate struct {
+	Version      string
+	Pusher       string
+	Pushee       string
+	Nonce        string
+	PGPSignature string
+}
+
 // ReferenceUpdateRequest values represent reference upload requests.
 // Values from this type are not zero-value safe, use the New function instead.
 type ReferenceUpdateRequest struct {
@@ -21,6 +29,7 @@ type ReferenceUpdateRequest struct {
 	Commands     []*Command
 	Options      []*Option
 	Shallow      *plumbing.Hash
+	Certificate  *Certificate
 	// Packfile contains an optional packfile reader.
 	Packfile io.ReadCloser
 
