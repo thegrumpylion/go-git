@@ -57,9 +57,17 @@ func GetBytesBuffer() *bytes.Buffer {
 	return buf
 }
 
-// PutBytesBuffer puts buf back into its sync.Pool.
+// maxPooledBuffer is the largest capacity a buffer is pooled at: one
+// grown past it is left to the collector, as a pool of buffers the
+// size of the largest objects they ever held is a working set the
+// collector counts as live — go's fmt draws the same line for its own
+// buffers.
+const maxPooledBuffer = 256 << 10
+
+// PutBytesBuffer puts buf back into its sync.Pool, unless it grew
+// past maxPooledBuffer.
 func PutBytesBuffer(buf *bytes.Buffer) {
-	if buf == nil {
+	if buf == nil || buf.Cap() > maxPooledBuffer {
 		return
 	}
 	bytesBuffer.Put(buf)

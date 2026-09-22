@@ -470,6 +470,9 @@ func objectEntry(r *Scanner) (stateFn, error) {
 		diskType: typ,
 		Size:     int64(size),
 	}
+	if typ.IsDelta() {
+		oh.deltaStreamSize = oh.Size
+	}
 
 	switch oh.Type {
 	case plumbing.OFSDeltaObject, plumbing.REFDeltaObject:

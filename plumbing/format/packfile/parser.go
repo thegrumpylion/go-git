@@ -2,6 +2,7 @@ package packfile
 
 import (
 	"bytes"
+	"container/list"
 	"errors"
 	"fmt"
 	"io"
@@ -67,9 +68,19 @@ func growHint(n int64) int {
 // ErrParserConsumed without running. Construct a new Parser for each
 // pack you intend to decode.
 type Parser struct {
-	storage       storer.EncodedObjectStorer
-	cache         *parserCache
-	lowMemoryMode bool
+	storage        storer.EncodedObjectStorer
+	cache          *parserCache
+	lowMemoryMode  bool
+	highMemoryMode bool // asked for by option; wins over the seekable default
+
+	// The delta walk's base cache in low memory mode: the contents
+	// held, most recently used first, their bytes, the budget they
+	// are trimmed to, and how many were derived again after eviction.
+	lru       *list.List
+	held      int64
+	heldLimit int64
+	derived   int
+	passes    int // passes over the REF-deltas the walk never reached
 
 	scanner   *Scanner
 	observers []Observer
@@ -96,6 +107,8 @@ type LowMemoryCapable interface {
 func NewParser(data io.Reader, opts ...ParserOption) *Parser {
 	p := &Parser{
 		objectFormat: format.DefaultObjectFormat,
+		heldLimit:    DefaultDeltaBaseCacheLimit,
+		lru:          list.New(),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -111,15 +124,17 @@ func NewParser(data io.Reader, opts ...ParserOption) *Parser {
 
 	p.scanner = NewScanner(data, sopts...)
 
+	// Low memory mode needs a seekable source: contents are dropped and
+	// inflated again from the pack on demand. Without a storage it is
+	// the default over such a source, the delta walk holding only the
+	// chain in flight; a storage decides for itself, and the option
+	// asks for high memory mode in either case.
+	p.lowMemoryMode = p.scanner.seeker != nil && !p.highMemoryMode
 	if p.storage != nil {
 		p.scanner.storage = p.storage
 
 		lm, ok := p.storage.(LowMemoryCapable)
-		p.lowMemoryMode = ok && lm.LowMemoryMode()
-	}
-
-	if p.scanner.seeker == nil {
-		p.lowMemoryMode = false
+		p.lowMemoryMode = p.lowMemoryMode && ok && lm.LowMemoryMode()
 	}
 	p.scanner.lowMemoryMode = p.lowMemoryMode
 	p.cache = newParserCache()
@@ -145,16 +160,6 @@ func (p *Parser) storeOrCache(oh *ObjectHeader) error {
 	}
 
 	if p.cache != nil {
-		o := oh
-		for p.lowMemoryMode && o.content != nil {
-			sync.PutBytesBuffer(o.content)
-			o.content = nil
-
-			if o.parent == nil || o.parent.content == nil {
-				break
-			}
-			o = o.parent
-		}
 		p.cache.Add(oh)
 	}
 
@@ -245,7 +250,7 @@ func (p *Parser) Parse() (plumbing.Hash, error) {
 
 func (p *Parser) ensureContent(oh *ObjectHeader) error {
 	// Skip if this object already has the correct content.
-	if oh.content != nil && oh.content.Len() == int(oh.Size) && !oh.Hash.IsZero() {
+	if !contentMissing(oh) && oh.content.Len() == int(oh.Size) && !oh.Hash.IsZero() {
 		return nil
 	}
 
@@ -266,11 +271,12 @@ func (p *Parser) ensureContent(oh *ObjectHeader) error {
 		deltaData := sync.GetBytesBuffer()
 		defer sync.PutBytesBuffer(deltaData)
 
-		err = p.scanner.inflateContent(oh.ContentOffset, deltaData, oh.Size)
+		err = p.scanner.inflateContent(oh.ContentOffset, deltaData, oh.deltaStreamSize)
 		if err != nil {
 			return fmt.Errorf("inflating content at offset %v: %w", oh.ContentOffset, err)
 		}
 
+		oh.content.Reset()
 		err = p.applyPatchBaseHeader(oh, deltaData, oh.content, nil)
 	default:
 		return fmt.Errorf("can't ensure content: %w", plumbing.ErrObjectNotFound)
@@ -279,6 +285,7 @@ func (p *Parser) ensureContent(oh *ObjectHeader) error {
 	if err != nil {
 		return fmt.Errorf("apply delta patch: %w", err)
 	}
+	p.hold(oh)
 	return nil
 }
 
@@ -287,6 +294,19 @@ func (p *Parser) ensureContent(oh *ObjectHeader) error {
 // together. Mirrors canonical Git's threaded_second_pass in
 // builtin/index-pack.c[1], which advances both kinds of children from
 // each in-progress parent in a single walk.
+//
+// In low memory mode the walk holds the contents of the chain in
+// flight alone, and those within a budget: a parent's content stays
+// in memory while its children are resolved against it and is
+// released when the walk backs out of it; when what is held exceeds
+// the delta base cache limit, the contents held longest are released
+// first, and a parent released before its next child needs it is
+// derived again by applying its chain from the nearest content still
+// held — the shape of canonical git's delta base cache. Memory is
+// bounded by the limit and one chain step, never by the pack's
+// decoded size or a chain's depth, which is what lets a source with
+// no storage behind it, the index built for a pack being written to
+// disk, parse a pack of any size.
 //
 // Splitting REF and OFS resolution into separate passes (REF first, OFS
 // second) is incorrect: a REF-delta whose base is an OFS-delta in the
@@ -328,6 +348,7 @@ func (p *Parser) resolveDeltas(ofsDeltas, refDeltas []*ObjectHeader) error {
 			if err := p.processDelta(c); err != nil {
 				return fmt.Errorf("processing ref-delta at offset %v: %w", c.Offset, err)
 			}
+			p.trim(c)
 			if err := visit(c); err != nil {
 				return err
 			}
@@ -339,10 +360,12 @@ func (p *Parser) resolveDeltas(ofsDeltas, refDeltas []*ObjectHeader) error {
 			if err := p.processDelta(c); err != nil {
 				return fmt.Errorf("processing ofs-delta at offset %v: %w", c.Offset, err)
 			}
+			p.trim(c)
 			if err := visit(c); err != nil {
 				return err
 			}
 		}
+		p.release(parent)
 		return nil
 	}
 
@@ -362,22 +385,161 @@ func (p *Parser) resolveDeltas(ofsDeltas, refDeltas []*ObjectHeader) error {
 		}
 	}
 
-	for _, d := range refDeltas {
-		if d.parent != nil {
-			continue
+	// A REF-delta the walk never reached names a base the walk did not
+	// resolve before it: one outside the pack, or one resolved only
+	// by a REF-delta listed after it. Each is tried in passes — a
+	// base not found defers the delta to the next pass, since another
+	// delta resolving in this one may be it — until a pass resolves
+	// nothing, when the base is outside the pack and the storage
+	// alike. A resolved one roots a chain of its own, walked the same
+	// way from it.
+	pending := refDeltas
+	for len(pending) > 0 {
+		p.passes++
+		var rest []*ObjectHeader
+		var deferred error
+		var deferredAt int64
+		progress := false
+		for _, d := range pending {
+			if !d.Hash.IsZero() {
+				// Resolved through the walk since it was listed: a
+				// delta's hash is known once it is.
+				continue
+			}
+			err := p.processDelta(d)
+			if errors.Is(err, ErrReferenceDeltaNotFound) || errors.Is(err, plumbing.ErrObjectNotFound) {
+				p.forget(d)
+				rest = append(rest, d)
+				if deferred == nil {
+					deferred, deferredAt = err, d.Offset
+				}
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf("processing ref-delta at offset %v: %w", d.Offset, err)
+			}
+			if err := visit(d); err != nil {
+				return err
+			}
+			if d.parent.externalRef {
+				p.release(d.parent)
+			}
+			progress = true
 		}
-		if err := p.processDelta(d); err != nil {
-			return fmt.Errorf("processing ref-delta at offset %v: %w", d.Offset, err)
+		if !progress && len(rest) > 0 {
+			return fmt.Errorf("processing ref-delta at offset %v: %w", deferredAt, deferred)
 		}
+		pending = rest
 	}
 
 	for _, d := range ofsDeltas {
-		if d.parent != nil {
+		if !d.Hash.IsZero() {
 			continue
 		}
 		return fmt.Errorf("processing ofs-delta at offset %v: %w", d.Offset, plumbing.ErrObjectNotFound)
 	}
 
+	return nil
+}
+
+// The delta base cache of low memory mode: the contents the walk
+// holds, in the order they entered. A content enters when it is
+// resolved or inflated and leaves when the walk backs out of it or
+// when the cache is trimmed to its budget, the earliest entered
+// first. What is held is the chain in flight, entered base first and
+// released as the walk backs out, and a chain derived again is
+// entered from its far end up: the earliest entered is the base end
+// of the chain and the least recently used both, so the base the
+// next child needs is the last to go, and no touch on use could
+// order the entries otherwise. An evicted base is derived again from
+// the nearest content still held when a child of it comes.
+
+// hold enters a content into the cache, or re-accounts one whose
+// buffer changed size.
+func (p *Parser) hold(oh *ObjectHeader) {
+	if !p.lowMemoryMode || oh.content == nil {
+		return
+	}
+	size := int64(oh.content.Cap())
+	if oh.heldElem == nil {
+		oh.heldElem = p.lru.PushFront(oh)
+	}
+	p.held += size - oh.heldBytes
+	oh.heldBytes = size
+}
+
+// release gives an object's content back to the pool, once nothing
+// in the walk needs it — a parent whose children are all resolved,
+// the placeholder of an external base — or once the cache is over
+// its budget.
+func (p *Parser) release(oh *ObjectHeader) {
+	if !p.lowMemoryMode || oh == nil || oh.content == nil {
+		return
+	}
+	if oh.heldElem != nil {
+		p.lru.Remove(oh.heldElem)
+		p.held -= oh.heldBytes
+		oh.heldElem, oh.heldBytes = nil, 0
+	}
+	sync.PutBytesBuffer(oh.content)
+	oh.content = nil
+}
+
+// trim releases the earliest entered contents while the cache is
+// over its budget, keeping the one the walk is about to use — which
+// a budget below one object would otherwise release too.
+func (p *Parser) trim(keep *ObjectHeader) {
+	for e := p.lru.Back(); e != nil && p.held > p.heldLimit; {
+		prev := e.Prev()
+		if oh := e.Value.(*ObjectHeader); oh != keep {
+			p.release(oh)
+		}
+		e = prev
+	}
+}
+
+// forget drops what a failed attempt at a delta left on it, so the
+// next attempt starts from nothing: the content allocated for it,
+// the placeholder parent, and the chain depth measured against that
+// placeholder — one link, where the real chain may be any length.
+// With no parent the delta counts as unresolved to the walk, which
+// reaches it through its base the moment that resolves: a thin pack
+// listing a chain leaf first resolves in one pass over the deferred
+// deltas, not one pass per link.
+func (p *Parser) forget(oh *ObjectHeader) {
+	p.release(oh)
+	oh.parent, oh.chainDepth = nil, 0
+}
+
+// contentMissing reports an object whose content is not in hand: none
+// held, or a buffer drained into a storage and not filled again —
+// an empty buffer is content only for an empty object.
+func contentMissing(oh *ObjectHeader) bool {
+	return oh.content == nil || (oh.content.Len() == 0 && oh.Size > 0)
+}
+
+// derive brings back the content of a delta the cache evicted: the
+// chain of evicted deltas up to the nearest held content or the
+// non-delta base is applied again from that end, one step at a time,
+// each step held and the cache trimmed to its budget keeping the step
+// the next one patches against.
+func (p *Parser) derive(oh *ObjectHeader) error {
+	var chain []*ObjectHeader
+	cur := oh
+	for ; cur != nil && contentMissing(cur) && cur.isDeltaOnDisk() && !cur.externalRef; cur = cur.parent {
+		chain = append(chain, cur)
+	}
+	if cur == nil {
+		return fmt.Errorf("deriving the delta at offset %v again: %w", oh.Offset, plumbing.ErrObjectNotFound)
+	}
+	for i := len(chain) - 1; i >= 0; i-- {
+		step := chain[i]
+		if err := p.ensureContent(step); err != nil {
+			return fmt.Errorf("deriving the delta at offset %v again: %w", step.Offset, err)
+		}
+		p.derived++
+		p.trim(step)
+	}
 	return nil
 }
 
@@ -404,10 +566,6 @@ func (p *Parser) processDelta(oh *ObjectHeader) error {
 		} else {
 			oh.parent = pa
 		}
-		// For a thin-pack external reference, store the placeholder so
-		// subsequent REF-deltas naming the same external hash chain
-		// through this entry. For an in-pack base the write is a no-op.
-		p.cache.oiByHash[oh.Reference] = oh.parent
 
 	default:
 		return fmt.Errorf("unsupported delta type: %v", oh.Type)
@@ -419,6 +577,14 @@ func (p *Parser) processDelta(oh *ObjectHeader) error {
 
 	if err := p.ensureContent(oh); err != nil {
 		return err
+	}
+
+	if oh.parent.externalRef {
+		// A thin pack's external reference, resolved: the placeholder
+		// is published so later REF-deltas naming the same hash chain
+		// through it. Published on success alone, so an attempt that
+		// failed — deferred for another pass — leaves nothing behind.
+		p.cache.oiByHash[oh.Reference] = oh.parent
 	}
 
 	return p.storeOrCache(oh)
@@ -495,6 +661,9 @@ func (p *Parser) parentReader(parent *ObjectHeader) (io.ReaderAt, int64, error) 
 
 				_, err = ioutil.CopyBufferPool(parent.content, r)
 				if err == nil {
+					// Filled from the storage: entered into the cache,
+					// or re-accounted where its buffer grew.
+					p.hold(parent)
 					return contents()
 				}
 			}
@@ -506,6 +675,16 @@ func (p *Parser) parentReader(parent *ObjectHeader) (io.ReaderAt, int64, error) 
 	// the packfile.
 	if !parent.externalRef && parent.ContentOffset == 0 {
 		return nil, 0, plumbing.ErrObjectNotFound
+	}
+
+	// What sits at a delta parent's content offset is its delta
+	// stream, not its content: a delta parent the cache evicted is
+	// derived again from the nearest content still held.
+	if parent.isDeltaOnDisk() && !parent.externalRef {
+		if err := p.derive(parent); err != nil {
+			return nil, 0, err
+		}
+		return contents()
 	}
 
 	// Not a seeker data source, so avoid seeking the content.
@@ -522,6 +701,7 @@ func (p *Parser) parentReader(parent *ObjectHeader) (io.ReaderAt, int64, error) 
 	if err != nil {
 		return nil, 0, ErrReferenceDeltaNotFound
 	}
+	p.hold(parent)
 	return contents()
 }
 

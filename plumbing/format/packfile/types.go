@@ -2,6 +2,7 @@ package packfile
 
 import (
 	"bytes"
+	"container/list"
 
 	"github.com/go-git/go-git/v6/plumbing"
 )
@@ -40,6 +41,17 @@ type ObjectHeader struct {
 	parent      *ObjectHeader
 	diskType    plumbing.ObjectType
 	externalRef bool
+
+	// deltaStreamSize is the length of a delta's stream in the pack,
+	// what Size held before resolution replaced it with the resolved
+	// object's size; deriving the object again inflates that many
+	// bytes from ContentOffset.
+	deltaStreamSize int64
+
+	// heldElem and heldBytes are the object's place and account in
+	// the parser's delta base cache while its content is held.
+	heldElem  *list.Element
+	heldBytes int64
 
 	// chainDepth caches the result of [checkDeltaChainDepth] for
 	// this header. A positive value is the number of delta links
